@@ -1,7 +1,6 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { Readable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
@@ -89,6 +88,7 @@ async function driveFetch(url: string, accessToken: string, init?: RequestInit) 
     try {
       const response = await fetch(url, {
         ...init,
+        redirect: "follow",
         headers: { ...(init?.headers || {}), Authorization: `Bearer ${accessToken}` },
         signal: init?.signal || AbortSignal.timeout(15 * 60 * 1000),
       });
@@ -96,6 +96,7 @@ async function driveFetch(url: string, accessToken: string, init?: RequestInit) 
       if (response.status === 401 || response.status === 403) throw new Error("Google Drive permission denied. Re-authorize Drive access and try again.");
       if (response.status === 404) throw new Error("The selected Google Drive file or folder no longer exists.");
       lastError = `Google Drive returned HTTP ${response.status}`;
+      await response.body?.cancel().catch(() => undefined);
     } catch (error) {
       if (error instanceof Error && error.message.includes("permission denied")) throw error;
       lastError = error instanceof Error ? error.message : lastError;
@@ -103,6 +104,54 @@ async function driveFetch(url: string, accessToken: string, init?: RequestInit) 
     await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
   }
   throw new Error(lastError);
+}
+
+function contentLengthFromHeader(value: string | null, name: string) {
+  if (!value) return undefined;
+  const contentLength = Number(value);
+  if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+    throw new Error(`Google Drive returned an invalid Content-Length for ${name}.`);
+  }
+  return contentLength;
+}
+
+function contentTypeForDownload(response: Response, expectedMimeType: string, name: string) {
+  const responseContentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() || "";
+  if (["application/json", "text/html", "text/plain"].includes(responseContentType)) {
+    throw new Error(`Google Drive returned a non-media response for ${name}.`);
+  }
+
+  const expectedIsGeneric = !expectedMimeType || expectedMimeType === "application/octet-stream";
+  if (responseContentType && responseContentType !== "application/octet-stream" && !expectedIsGeneric) {
+    const expectedFamily = expectedMimeType.split("/", 1)[0];
+    const responseFamily = responseContentType.split("/", 1)[0];
+    if (expectedFamily && responseFamily && expectedFamily !== responseFamily) {
+      throw new Error(`Google Drive returned an unexpected Content-Type for ${name}.`);
+    }
+  }
+
+  return responseContentType && responseContentType !== "application/octet-stream"
+    ? responseContentType
+    : expectedMimeType || "application/octet-stream";
+}
+
+function validateDriveStream(body: ReadableStream<Uint8Array>, expectedLength: number | undefined, name: string) {
+  let receivedLength = 0;
+  return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      if (!(chunk instanceof Uint8Array)) {
+        controller.error(new Error(`Google Drive returned an invalid byte stream for ${name}.`));
+        return;
+      }
+      receivedLength += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    flush(controller) {
+      if (expectedLength !== undefined && receivedLength !== expectedLength) {
+        controller.error(new Error(`Google Drive returned ${receivedLength} bytes for ${name}; expected ${expectedLength}.`));
+      }
+    },
+  }));
 }
 
 async function listFolderChildren(folderId: string, accessToken: string) {
@@ -332,20 +381,56 @@ export async function POST(req: NextRequest) {
       const parentFolder = folderSegments[folderSegments.length - 1] || "";
       const type = itemTypeFor(mimeType, name);
 
-      const downloadResponse = await driveFetch(`${DRIVE_API}/${encodeURIComponent(selectedFile.id)}?alt=media`, accessToken);
-      if (!downloadResponse.body) throw new Error(`Google Drive returned no file stream for ${name}.`);
-      const contentLength = Number(downloadResponse.headers.get("content-length") || size || 0) || undefined;
+      const downloadResponse = await driveFetch(
+        `${DRIVE_API}/${encodeURIComponent(selectedFile.id)}?alt=media`,
+        accessToken,
+        { headers: { "Accept-Encoding": "identity" } }
+      );
+
+      console.log("========== GOOGLE DRIVE DOWNLOAD ==========");
+      console.log("File:", name);
+      console.log("Status:", downloadResponse.status);
+      console.log("Content-Type:", downloadResponse.headers.get("content-type"));
+      console.log("Content-Length:", downloadResponse.headers.get("content-length"));
+      console.log(
+        "Content-Disposition:",
+        downloadResponse.headers.get("content-disposition")
+      );
+      console.log("===========================================");
+
+      if (!downloadResponse.body) {
+        throw new Error(`Google Drive returned no file stream for ${name}.`);
+      }
+
+      if (downloadResponse.status !== 200) {
+        throw new Error(`Google Drive returned an unexpected HTTP ${downloadResponse.status} response for ${name}.`);
+      }
+      const responseContentLength = contentLengthFromHeader(downloadResponse.headers.get("content-length"), name);
+      if (responseContentLength !== undefined && size !== undefined && responseContentLength !== size) {
+        throw new Error(`Google Drive returned an unexpected Content-Length for ${name}.`);
+      }
+      const contentLength = responseContentLength ?? size;
+      const contentType = contentTypeForDownload(downloadResponse, mimeType, name);
       const extension = extensionFor(name, mimeType);
       const keyParts = ["courses", safeR2Segment(courseId), ...folderSegments.map(safeR2Segment)];
       const safeName = safeR2Segment(name.replace(/\.[^.]+$/, ""));
       let key = [...keyParts, `${safeName}.${extension}`].join("/");
       if (existingStorageKeys.has(key)) key = [...keyParts, `${safeName}-${randomUUID()}.${extension}`].join("/");
 
+      const arrayBuffer = await downloadResponse.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      if (contentLength && buffer.length !== contentLength) {
+        throw new Error(
+          `Google Drive download incomplete. Expected ${contentLength} bytes but received ${buffer.length} bytes.`
+        );
+      }
+
       const uploaded = await putR2Object({
         key,
-        body: Readable.fromWeb(downloadResponse.body as Parameters<typeof Readable.fromWeb>[0]),
+        body: buffer,
         contentType: mimeType,
-        contentLength,
+        contentLength: buffer.length,
       });
       importedKeys.push(uploaded.key);
       existingStorageKeys.add(uploaded.key);

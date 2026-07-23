@@ -47,7 +47,7 @@ export function safeR2Segment(value: string) {
 
 type R2StreamUploadOptions = {
   key: string;
-  body: Readable;
+  body: Readable | ReadableStream<Uint8Array>;
   contentType: string;
   contentLength?: number;
   metadata?: Record<string, string>;
@@ -62,7 +62,7 @@ export function startR2StreamUpload({ key, body, contentType, contentLength, met
       Key: key,
       Body: body,
       ContentType: contentType,
-      ...(contentLength ? { ContentLength: contentLength } : {}),
+      ...(contentLength !== undefined ? { ContentLength: contentLength } : {}),
       ...(metadata ? { Metadata: metadata } : {}),
     },
     queueSize: 4,
@@ -81,7 +81,7 @@ export async function putR2Object({
   contentLength,
 }: {
   key: string;
-  body: Buffer | Readable;
+  body: Buffer | Readable | ReadableStream<Uint8Array>;
   contentType: string;
   contentLength?: number;
 }) {
@@ -91,7 +91,7 @@ export async function putR2Object({
     Key: key,
     Body: body,
     ContentType: contentType,
-    ...(contentLength ? { ContentLength: contentLength } : {}),
+    ...(contentLength !== undefined ? { ContentLength: contentLength } : {}),
   };
 
   if (Buffer.isBuffer(body)) {
