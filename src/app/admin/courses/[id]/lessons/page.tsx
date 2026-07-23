@@ -72,6 +72,24 @@ function isSupportedFile(file: File) {
   return isPdfFile(file) || isVideoFile(file) || isImageFile(file);
 }
 
+function isHiddenMacFile(file: File) {
+  return file.name === ".DS_Store" || file.name.startsWith("._");
+}
+
+async function readJsonResponse<T extends { error?: string }>(response: Response) {
+  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+  if (!text) return {} as T;
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return { error: `Request failed (HTTP ${response.status})` } as T;
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return { error: `Request returned invalid JSON (HTTP ${response.status})` } as T;
+  }
+}
+
 function formatBytes(bytes?: number) {
   if (!bytes) return "Size unavailable";
   const units = ["B", "KB", "MB", "GB"];
@@ -409,8 +427,9 @@ export default function AdminCourseLessonsPage() {
       toast({ message: "Select a new folder before uploading a folder.", type: "info" });
       return;
     }
-    const validEntries = entries.filter(({ file }) => isSupportedFile(file));
-    const invalidEntries = entries.filter(({ file }) => !isSupportedFile(file));
+    const visibleEntries = entries.filter(({ file }) => !isHiddenMacFile(file));
+    const validEntries = visibleEntries.filter(({ file }) => isSupportedFile(file));
+    const invalidEntries = visibleEntries.filter(({ file }) => !isSupportedFile(file));
     if (invalidEntries.length) toast({ message: `${invalidEntries.map(({ file }) => file.name).join(", ")} skipped: only video, PDF and image files are supported.`, type: "error" });
     if (!validEntries.length) return;
 
@@ -427,15 +446,26 @@ export default function AdminCourseLessonsPage() {
         updateTask(task.id, { status: "uploading", error: undefined });
         try {
           updateTask(task.id, { progress: 1 });
-          const form = new FormData();
-          form.append("courseId", courseId);
-          form.append("folderId", activeFolderId);
-          form.append("folderSegments", JSON.stringify(task.folderSegments || []));
-          form.append("fileName", task.file.name);
-          form.append("contentType", task.file.type || "application/octet-stream");
-          form.append("file", task.file, task.file.name);
-          const response = await fetch("/api/local-folder/import", { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form });
-          const data = await response.json() as { error?: string };
+          const folder = ["courses", courseId, ...(task.folderSegments || [])].join("/");
+          const uploaded = await uploadFile(task.file, folder, {
+            uploadId: task.id,
+            onProgress: (value) => updateTask(task.id, { progress: value.percentage }),
+          });
+          const response = await fetch("/api/local-folder/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify({
+              courseId,
+              folderId: activeFolderId,
+              folderSegments: task.folderSegments || [],
+              fileName: task.file.name,
+              contentType: uploaded.contentType || task.file.type || "application/octet-stream",
+              size: uploaded.size,
+              storageKey: uploaded.key,
+              url: uploaded.url,
+            }),
+          });
+          const data = await readJsonResponse<{ error?: string }>(response);
           if (!response.ok) throw new Error(data.error || `Could not import ${task.file.name}`);
           updateTask(task.id, { status: "completed", progress: 100 });
         } catch (error) {

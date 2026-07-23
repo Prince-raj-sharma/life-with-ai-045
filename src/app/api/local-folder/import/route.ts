@@ -2,23 +2,30 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-import { randomUUID } from "node:crypto";
-import { Readable } from "node:stream";
-import busboy from "busboy";
 import { NextRequest, NextResponse } from "next/server";
 import { ensureFolderHierarchy, folderMapKey, type CourseFolderRecord } from "@/lib/course-folder-hierarchy";
 import { adminDb } from "@/lib/firebase-admin";
-import { deleteR2Objects, putR2Object, safeR2Segment } from "@/lib/r2";
+import { deleteR2Objects, safeR2Segment } from "@/lib/r2";
 import { isAdminRequest } from "@/lib/server-auth";
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024;
-const MAX_MULTIPART_OVERHEAD = 2 * 1024 * 1024;
 
 type LocalFolderFile = {
   name: string;
   mimeType: string;
   size: number;
   folderSegments: string[];
+};
+
+type LocalFolderImportBody = {
+  courseId?: unknown;
+  folderId?: unknown;
+  folderSegments?: unknown;
+  fileName?: unknown;
+  contentType?: unknown;
+  size?: unknown;
+  storageKey?: unknown;
+  url?: unknown;
 };
 
 function extensionFor(name: string, mimeType: string) {
@@ -50,21 +57,6 @@ function fallbackMimeType(name: string) {
   return "application/octet-stream";
 }
 
-function parseFolderSegments(value: string | undefined) {
-  if (!value) return [];
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((segment): segment is string => typeof segment === "string").map((segment) => segment.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-function requestHeaders(req: NextRequest) {
-  return Object.fromEntries(req.headers.entries());
-}
-
 async function verifyFolder(courseId: string, folderId: string) {
   const folder = await adminDb.collection("courseFolders").doc(folderId).get();
   return folder.exists && folder.data()?.courseId === courseId;
@@ -75,7 +67,6 @@ async function prepareImport(courseId: string, destinationFolderId: string, file
     adminDb.collection("courseItems").where("courseId", "==", courseId).get(),
     adminDb.collection("courseFolders").where("courseId", "==", courseId).get(),
   ]);
-  const existingStorageKeys = new Set(existingItems.docs.map((doc) => String(doc.data().storageKey || doc.data().r2Key || "")).filter(Boolean));
   const nextOrderByFolder = new Map<string, number>();
   existingItems.docs.forEach((doc) => {
     const itemFolderId = String(doc.data().folderId || "");
@@ -109,11 +100,6 @@ async function prepareImport(courseId: string, destinationFolderId: string, file
     source: "manual",
   });
   const folderPath = file.folderSegments.join("/");
-  const keyParts = ["courses", safeR2Segment(courseId), ...file.folderSegments.map(safeR2Segment)];
-  const safeName = safeR2Segment(file.name.replace(/\.[^.]+$/, ""));
-  const extension = extensionFor(file.name, file.mimeType);
-  let key = [...keyParts, `${safeName}.${extension}`].join("/");
-  if (existingStorageKeys.has(key)) key = [...keyParts, `${safeName}-${randomUUID()}.${extension}`].join("/");
 
   return {
     itemFolderId,
@@ -121,9 +107,33 @@ async function prepareImport(courseId: string, destinationFolderId: string, file
     parentFolder: file.folderSegments[file.folderSegments.length - 1] || "",
     type: itemTypeFor(file.mimeType, file.name),
     mimeType: file.mimeType,
-    key,
     order: nextOrderByFolder.get(itemFolderId) || 0,
   };
+}
+
+function isHiddenMacFile(name: string) {
+  return name === ".DS_Store" || name.startsWith("._");
+}
+
+function folderSegmentsFromBody(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((segment): segment is string => typeof segment === "string")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function numberValue(value: unknown) {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+}
+
+function expectedR2Prefix(courseId: string, folderSegments: string[]) {
+  return ["courses", safeR2Segment(courseId), ...folderSegments.map(safeR2Segment)].join("/");
 }
 
 function storageError(error: unknown) {
@@ -139,89 +149,37 @@ export async function POST(req: NextRequest) {
   let importedKey = "";
   let importedRef: FirebaseFirestore.DocumentReference | null = null;
   try {
-    if (!req.body) return NextResponse.json({ error: "Upload request body is empty." }, { status: 400 });
-    const contentLength = Number(req.headers.get("content-length") || 0);
-    if (contentLength > MAX_FILE_BYTES + MAX_MULTIPART_OVERHEAD) return NextResponse.json({ error: "Files must be 5 GB or smaller.", code: "FILE_TOO_LARGE" }, { status: 413 });
-    const contentType = req.headers.get("content-type") || "";
-    if (!contentType.toLowerCase().startsWith("multipart/form-data")) return NextResponse.json({ error: "Upload requests must use multipart/form-data.", code: "MULTIPART_REQUIRED" }, { status: 415 });
+    if (!req.body) throw Object.assign(new Error("Import metadata is required."), { status: 400, code: "IMPORT_INPUT_REQUIRED" });
+    let body: LocalFolderImportBody;
+    try {
+      body = await req.json() as LocalFolderImportBody;
+    } catch {
+      throw Object.assign(new Error("Import metadata must be valid JSON."), { status: 400, code: "INVALID_JSON" });
+    }
 
-    const incoming = Readable.fromWeb(req.body as Parameters<typeof Readable.fromWeb>[0]);
-    const parser = busboy({
-      headers: requestHeaders(req),
-      limits: { files: 1, fields: 8, fieldSize: 4096, fileSize: MAX_FILE_BYTES, parts: 12 },
-    });
-    const fields = new Map<string, string>();
-    let fileSeen = false;
-    let uploadedSize = 0;
-    type LocalImportResult = { file: LocalFolderFile; prepared: Awaited<ReturnType<typeof prepareImport>>; uploaded: { key: string; url: string } };
-    let fileProcessing: Promise<LocalImportResult> | null = null;
-    let failed = false;
+    const courseId = stringValue(body.courseId);
+    const destinationFolderId = stringValue(body.folderId);
+    const name = stringValue(body.fileName).replace(/[\\/\r\n]+/g, "-") || "upload.bin";
+    const mimeType = stringValue(body.contentType) || fallbackMimeType(name);
+    const size = numberValue(body.size);
+    const folderSegments = folderSegmentsFromBody(body.folderSegments);
+    const storageKey = stringValue(body.storageKey);
+    const url = stringValue(body.url);
 
-    let resolveParser!: () => void;
-    let rejectParser!: (error: unknown) => void;
-    const parserFinished = new Promise<void>((resolve, reject) => {
-      resolveParser = resolve;
-      rejectParser = reject;
-    });
+    if (!courseId || !destinationFolderId || !storageKey || !url) {
+      throw Object.assign(new Error("Course, destination folder and uploaded R2 metadata are required."), { status: 400, code: "IMPORT_INPUT_REQUIRED" });
+    }
+    if (isHiddenMacFile(name)) return NextResponse.json({ success: true, skipped: true, items: [] });
+    if (!size || size > MAX_FILE_BYTES) throw Object.assign(new Error("Files must be 5 GB or smaller."), { status: 413, code: "FILE_TOO_LARGE" });
+    if (!isSupportedFile(name, mimeType)) throw Object.assign(new Error(`${name} has an unsupported file type.`), { status: 400, code: "UNSUPPORTED_FILE_TYPE" });
+    if (!storageKey.startsWith(`${expectedR2Prefix(courseId, folderSegments)}/`)) {
+      throw Object.assign(new Error("Uploaded file does not match the selected course folder."), { status: 400, code: "INVALID_STORAGE_KEY" });
+    }
+    if (!(await verifyFolder(courseId, destinationFolderId))) throw Object.assign(new Error("Destination folder not found"), { status: 404, code: "FOLDER_NOT_FOUND" });
 
-    const fail = (error: unknown) => {
-      if (failed) return;
-      failed = true;
-      rejectParser(error);
-      parser.destroy();
-      incoming.destroy(error instanceof Error ? error : new Error("Local folder import failed"));
-    };
-
-    parser.on("field", (name, value) => fields.set(name, value));
-    parser.on("file", (fieldName, file, info) => {
-      if (fieldName !== "file" || fileSeen) {
-        file.resume();
-        fail(new Error("Exactly one file field named file is required."));
-        return;
-      }
-      fileSeen = true;
-      file.pause();
-      const name = String(info.filename || fields.get("fileName") || "upload.bin").replace(/[\\/\r\n]+/g, "-").trim() || "upload.bin";
-      const mimeType = String(fields.get("contentType") || info.mimeType || fallbackMimeType(name));
-      const folderSegments = parseFolderSegments(fields.get("folderSegments"));
-      const courseId = fields.get("courseId") || "";
-      const destinationFolderId = fields.get("folderId") || "";
-      if (!courseId || !destinationFolderId || !isSupportedFile(name, mimeType)) {
-        file.resume();
-        fail(!courseId || !destinationFolderId ? new Error("Course and destination folder are required") : new Error(`${name} has an unsupported file type.`));
-        return;
-      }
-
-      file.on("data", (chunk: Buffer) => { uploadedSize += chunk.length; });
-      file.on("limit", () => fail(Object.assign(new Error("Files must be 5 GB or smaller."), { status: 413, code: "FILE_TOO_LARGE" })));
-      file.on("error", fail);
-      fileProcessing = (async () => {
-        const localFile = { name, mimeType, size: 0, folderSegments };
-        if (!(await verifyFolder(courseId, destinationFolderId))) throw new Error("Destination folder not found");
-        const prepared = await prepareImport(courseId, destinationFolderId, localFile);
-        const uploadPromise = putR2Object({ key: prepared.key, body: file, contentType: mimeType });
-        file.resume();
-        const uploaded = await uploadPromise;
-        importedKey = uploaded.key;
-        return { file: localFile, prepared, uploaded };
-      })();
-      fileProcessing.catch(fail);
-    });
-    parser.on("filesLimit", () => fail(new Error("Only one file can be uploaded at a time.")));
-    parser.on("partsLimit", () => fail(new Error("Upload form contains too many parts.")));
-    parser.on("error", fail);
-    parser.on("finish", () => { if (!failed) resolveParser(); });
-    incoming.on("error", fail);
-    req.signal.addEventListener("abort", () => fail(Object.assign(new Error("Upload cancelled by the client."), { code: "UPLOAD_CANCELLED" })), { once: true });
-    incoming.pipe(parser);
-
-    await parserFinished;
-    const processing = fileProcessing as Promise<LocalImportResult> | null;
-    const imported = processing ? await processing : null;
-    if (!imported || !fileSeen) throw new Error("A file field named file is required.");
-    const courseId = fields.get("courseId") || "";
-
-    const { file, prepared, uploaded } = imported;
+    importedKey = storageKey;
+    const file: LocalFolderFile = { name, mimeType, size, folderSegments };
+    const prepared = await prepareImport(courseId, destinationFolderId, file);
     const now = new Date().toISOString();
     const itemData = {
       courseId,
@@ -229,17 +187,17 @@ export async function POST(req: NextRequest) {
       type: prepared.type,
       title: file.name,
       name: file.name,
-      url: uploaded.url,
-      ...(prepared.type === "video" ? { videoUrl: uploaded.url } : prepared.type === "pdf" ? { pdfUrl: uploaded.url } : { imageUrl: uploaded.url }),
+      url,
+      ...(prepared.type === "video" ? { videoUrl: url } : prepared.type === "pdf" ? { pdfUrl: url } : { imageUrl: url }),
       thumbnail: "",
       duration: 0,
-      size: uploadedSize,
+      size,
       order: prepared.order,
       createdAt: now,
       updatedAt: now,
-      storageKey: uploaded.key,
-      r2Key: uploaded.key,
-      r2Url: uploaded.url,
+      storageKey,
+      r2Key: storageKey,
+      r2Url: url,
       mimeType: file.mimeType,
       folderPath: prepared.folderPath,
       parentFolder: prepared.parentFolder,
@@ -255,6 +213,7 @@ export async function POST(req: NextRequest) {
     if (importedKey) await deleteR2Objects([importedKey]).catch((cleanupError) => console.error("Local folder R2 cleanup error:", cleanupError));
     const result = storageError(error);
     const status = error && typeof error === "object" && "status" in error ? Number(error.status) : result.status;
-    return NextResponse.json({ error: result.message, code: "LOCAL_FOLDER_IMPORT_FAILED", retryable: status >= 500 }, { status });
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "LOCAL_FOLDER_IMPORT_FAILED";
+    return NextResponse.json({ error: result.message, code, retryable: status >= 500 }, { status });
   }
 }

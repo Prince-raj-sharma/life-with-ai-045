@@ -21,9 +21,15 @@ type UploadResult = {
 };
 
 function createObjectKey(folder: string, fileName: string) {
+  const folderPath = folder
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .map(safeR2Segment)
+    .join("/") || "uploads";
   const extension = fileName.split(".").pop()?.toLowerCase() || "bin";
   const baseName = safeR2Segment(fileName.replace(/\.[^.]+$/, ""));
-  return `${safeR2Segment(folder)}/${randomUUID()}-${baseName}.${safeR2Segment(extension)}`;
+  return `${folderPath}/${randomUUID()}-${baseName}.${safeR2Segment(extension)}`;
 }
 
 function storageError(error: unknown) {
