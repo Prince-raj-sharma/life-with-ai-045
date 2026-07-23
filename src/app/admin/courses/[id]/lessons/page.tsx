@@ -43,10 +43,18 @@ type UploadTaskStatus = "queued" | "uploading" | "completed" | "failed" | "cance
 interface UploadTask {
   id: string;
   file: File;
+  folderSegments?: string[];
   status: UploadTaskStatus;
   progress: number;
   error?: string;
 }
+
+interface LocalFolderEntry {
+  file: File;
+  folderSegments: string[];
+}
+
+const localFolderInputProps = { webkitdirectory: "" } as { webkitdirectory: string };
 
 function isPdfFile(file: File) {
   return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
@@ -132,6 +140,7 @@ export default function AdminCourseLessonsPage() {
   const queryClient = useQueryClient();
   const { uploadFile, cancelUpload, uploading } = useUpload();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const localFolderInputRef = useRef<HTMLInputElement>(null);
   const replaceInputRef = useRef<HTMLInputElement>(null);
   const fileListRef = useRef<HTMLDivElement>(null);
   const queueCancelled = useRef(false);
@@ -395,9 +404,70 @@ export default function AdminCourseLessonsPage() {
     }
   };
 
+  const uploadLocalFolderEntries = async (entries: LocalFolderEntry[]) => {
+    if (!activeFolderId || activeFolderId.startsWith("legacy-")) {
+      toast({ message: "Select a new folder before uploading a folder.", type: "info" });
+      return;
+    }
+    const validEntries = entries.filter(({ file }) => isSupportedFile(file));
+    const invalidEntries = entries.filter(({ file }) => !isSupportedFile(file));
+    if (invalidEntries.length) toast({ message: `${invalidEntries.map(({ file }) => file.name).join(", ")} skipped: only video, PDF and image files are supported.`, type: "error" });
+    if (!validEntries.length) return;
+
+    const tasks = validEntries.map(({ file, folderSegments }, index) => ({ id: `${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`, file, folderSegments, status: "queued" as const, progress: 0 }));
+    setUploadTasks(tasks);
+    setBusyAction(true);
+    queueCancelled.current = false;
+    let failedCount = 0;
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) throw new Error("Admin authentication expired. Sign in again.");
+      for (const task of tasks) {
+        if (queueCancelled.current) break;
+        updateTask(task.id, { status: "uploading", error: undefined });
+        try {
+          updateTask(task.id, { progress: 1 });
+          const form = new FormData();
+          form.append("courseId", courseId);
+          form.append("folderId", activeFolderId);
+          form.append("folderSegments", JSON.stringify(task.folderSegments || []));
+          form.append("fileName", task.file.name);
+          form.append("contentType", task.file.type || "application/octet-stream");
+          form.append("file", task.file, task.file.name);
+          const response = await fetch("/api/local-folder/import", { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form });
+          const data = await response.json() as { error?: string };
+          if (!response.ok) throw new Error(data.error || `Could not import ${task.file.name}`);
+          updateTask(task.id, { status: "completed", progress: 100 });
+        } catch (error) {
+          failedCount += 1;
+          updateTask(task.id, { status: "failed", error: error instanceof Error ? error.message : "Folder file import failed" });
+        }
+      }
+      await refresh();
+      if (failedCount) toast({ title: "Folder upload completed with errors", message: `${failedCount} file(s) failed. Retry is available below.`, type: "error" });
+      else toast({ title: "Folder upload complete", message: `${tasks.length} file(s) copied to Cloudflare R2.`, type: "success" });
+    } catch (error) {
+      toast({ message: error instanceof Error ? error.message : "Folder upload failed", type: "error" });
+    } finally {
+      setBusyAction(false);
+      if (localFolderInputRef.current) localFolderInputRef.current.value = "";
+    }
+  };
+
+  const uploadFolderFiles = (files: FileList | File[]) => {
+    const entries = Array.from(files).map((file) => {
+      const pathSegments = (file.webkitRelativePath || file.name).split("/").filter(Boolean);
+      pathSegments.pop();
+      return { file, folderSegments: pathSegments };
+    });
+    void uploadLocalFolderEntries(entries);
+  };
+
   const retryFailedUploads = () => {
-    const failed = uploadTasks.filter((task) => task.status === "failed").map((task) => task.file);
-    if (failed.length) void uploadFiles(failed);
+    const failed = uploadTasks.filter((task) => task.status === "failed");
+    const folderEntries = failed.filter((task) => task.folderSegments).map(({ file, folderSegments }) => ({ file, folderSegments: folderSegments || [] }));
+    if (folderEntries.length === failed.length && folderEntries.length) void uploadLocalFolderEntries(folderEntries);
+    else if (failed.length) void uploadFiles(failed.map((task) => task.file));
   };
 
   const cancelQueue = () => {
@@ -600,6 +670,7 @@ export default function AdminCourseLessonsPage() {
         </div>
         <div className="flex flex-wrap gap-2">
           <button type="button" onClick={createFolder} disabled={busyAction} className="inline-flex items-center gap-2 rounded-xl bg-[#1D4ED8] px-4 py-2.5 text-xs font-bold text-white shadow transition hover:bg-blue-800 disabled:opacity-50"><FolderPlus className="h-4 w-4" /> Create Folder</button>
+          {activeFolderId && !activeFolderId.startsWith("legacy-") && <><input {...localFolderInputProps} ref={localFolderInputRef} type="file" multiple className="hidden" onChange={(event) => { if (event.target.files) uploadFolderFiles(event.target.files); }} /><button type="button" onClick={() => localFolderInputRef.current?.click()} disabled={busyAction} className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-bold text-white shadow transition hover:bg-slate-700 disabled:opacity-50"><Upload className="h-4 w-4" /> Upload folder</button></>}
           {activeFolderId && !activeFolderId.startsWith("legacy-") && <GoogleDrivePicker courseId={courseId} folderId={activeFolderId} onImported={refresh} />}
         </div>
       </div>
